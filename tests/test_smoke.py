@@ -64,6 +64,39 @@ def test_titans_toy_task():
     assert -1.0 <= conf <= 1.0
 
 
+def test_titans_learned_projections():
+    dim = 32
+    mem = NoesisTitansLMM(dim=dim, device="cpu")
+    hidden = torch.randn(64, dim)
+
+    w_key_before = mem.W_key.weight.clone()
+    w_val_before = mem.W_val.weight.clone()
+    gate_forget_before = mem.gate_forget[0].weight.clone()
+    gate_momentum_before = mem.gate_momentum[0].weight.clone()
+    gate_lr_before = mem.gate_lr[0].weight.clone()
+
+    mem.learn(hidden, surprise=1.0)
+
+    # Key/value projections must move when there is a reconstruction signal.
+    assert not torch.allclose(mem.W_key.weight, w_key_before)
+    assert not torch.allclose(mem.W_val.weight, w_val_before)
+    # Gating networks must also move via the surrogate loss.
+    assert not torch.allclose(mem.gate_forget[0].weight, gate_forget_before)
+    assert not torch.allclose(mem.gate_momentum[0].weight, gate_momentum_before)
+    assert not torch.allclose(mem.gate_lr[0].weight, gate_lr_before)
+
+
+def test_titans_compress_memory():
+    dim = 32
+    mem = NoesisTitansLMM(dim=dim, device="cpu")
+    # Fill M with small and large rows.
+    mem.M.normal_(0, 0.05)
+    mem.M[0] = 10.0  # large row
+    compressed = mem.compress_memory(threshold=1.0)
+    assert compressed >= 1
+    assert torch.all(mem.M[0] != 0.0)
+
+
 def test_sparse_cache_write_and_retrieve():
     cache = NoesisSparseCache(dim=32, capacity=100, device="cpu")
     k = torch.randn(32)
@@ -157,3 +190,8 @@ def test_consolidator_domain_adaptation(tmp_path):
     assert os.path.exists(path)
     # A new expert should have been loaded into one of the active MoE slots.
     assert engine.moe.expert_mask.sum().item() > 0
+    # The previous occupant of the chosen slot should have been backed up.
+    backup_files = [
+        f for f in os.listdir("noesis_experts") if f.startswith("backup_slot")
+    ]
+    assert len(backup_files) > 0

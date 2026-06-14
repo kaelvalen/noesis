@@ -163,7 +163,7 @@ class NoesisEngine:
         # 6. Titans learn (CPU, persistent).
         # TTT output is already detached (gradient barrier); no extra detach needed.
         ttt_cpu = ttt_out[0].cpu()  # (seq, dim) on CPU
-        titans_loss = self.titans.learn(ttt_cpu)
+        titans_loss = self.titans.learn(ttt_cpu, surprise=surprise)
 
         # 7. Sparse cache write (if surprising).
         last_k = self.titans.W_key(ttt_cpu[-1])

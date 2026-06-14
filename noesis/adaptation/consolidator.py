@@ -8,6 +8,10 @@ The adapter learns to map the TTT-adapted hidden state to the actual token
 distribution the model observed. This is a language-modeling objective over
 the raw interaction tokens, not an autoencoder: the new expert must predict
 which tokens appeared, not reconstruct its own input.
+
+Optionally, EWC (Elastic Weight Consolidation) regularization penalizes large
+deviations from the currently active experts, reducing catastrophic forgetting
+when a new expert replaces an old slot.
 """
 
 import os
@@ -23,7 +27,16 @@ class NoesisConsolidator:
     def __init__(self, engine):
         self.engine = engine
 
-    def run(self, topk=500, min_traces=100, epochs=5, val_split=0.1):
+    def run(
+        self,
+        topk=500,
+        min_traces=100,
+        epochs=5,
+        val_split=0.1,
+        use_ewc=True,
+        ewc_lambda=100.0,
+        fisher_samples=200,
+    ):
         """Train a domain logit adapter on high-surprise traces and install it as an expert."""
         traces = sorted(
             self.engine.session_traces,
@@ -90,11 +103,33 @@ class NoesisConsolidator:
         )
         opt = torch.optim.Adam(adapter.parameters(), lr=1e-4)
 
+        # EWC setup: remember old parameters and Fisher diagonal of active experts.
+        fisher_reg = {}
+        old_params = {}
+        if use_ewc:
+            fisher_reg = self._compute_fisher(
+                self.engine.moe, X_train, Y_train, n_samples=fisher_samples
+            )
+            old_params = {
+                name: param.clone().detach()
+                for name, param in adapter.named_parameters()
+            }
+
         best_val_loss = float("inf")
         for epoch in range(epochs):
             adapter.train()
             pred = adapter(X_train)  # (N, vocab_size)
             loss = F.cross_entropy(pred, Y_train)
+
+            if use_ewc and fisher_reg and old_params:
+                ewc_loss = 0.0
+                for name, param in adapter.named_parameters():
+                    if name in fisher_reg and name in old_params:
+                        ewc_loss += (
+                            fisher_reg[name] * (param - old_params[name]) ** 2
+                        ).sum()
+                loss = loss + ewc_lambda * ewc_loss
+
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -115,15 +150,69 @@ class NoesisConsolidator:
         path = f"noesis_experts/domain_{int(time.time())}.pt"
         torch.save(adapter.state_dict(), path)
 
-        # Activate in MoE.
+        # Activate in MoE. If no empty slot, back up the least-used expert first.
         moe = self.engine.moe
         empty = (moe.expert_mask == 0).nonzero(as_tuple=False)
         if len(empty) > 0:
-            moe.swap_expert(empty[0].item(), path)
+            target_slot = empty[0].item()
         else:
-            # Replace lowest-usage active expert (LRU heuristic: slot 0).
-            moe.swap_expert(0, path)
+            target_slot = self._find_least_used_slot(moe)
+            backup_path = (
+                f"noesis_experts/backup_slot{target_slot}_{int(time.time())}.pt"
+            )
+            existing_state = {
+                k: v.clone() for k, v in moe.active_experts[target_slot].state_dict().items()
+            }
+            torch.save(existing_state, backup_path)
+            print(f"Backed up existing expert in slot {target_slot} to {backup_path}")
+
+        moe.swap_expert(target_slot, path)
+        if hasattr(moe, "expert_usage"):
+            moe.expert_usage[target_slot] = 0.0
 
         # Clear traces.
         self.engine.session_traces = []
         return path
+
+    def _find_least_used_slot(self, moe):
+        """Return the active expert slot with the lowest usage count.
+
+        Falls back to slot 0 if no usage statistics have been collected yet.
+        """
+        if not hasattr(moe, "expert_usage"):
+            return 0
+        return torch.argmin(moe.expert_usage).item()
+
+    def _compute_fisher(self, moe, X, Y, n_samples=200):
+        """Estimate the diagonal Fisher information of the active experts.
+
+        The Fisher values are averaged across all active experts and normalized
+        by the number of samples used. The resulting keys match the parameter
+        names of a standard MoE expert / consolidation adapter, so they can be
+        used directly for EWC regularization.
+        """
+        fisher = {}
+        n = min(n_samples, len(X))
+        if n == 0:
+            return fisher
+        idx = torch.randperm(len(X))[:n]
+
+        total_samples = 0
+        for expert in moe.active_experts:
+            expert.train()
+            for i in idx:
+                expert.zero_grad()
+                out = expert(X[i].unsqueeze(0))
+                loss = F.cross_entropy(out, Y[i].unsqueeze(0))
+                loss.backward()
+                for name, param in expert.named_parameters():
+                    if param.grad is not None:
+                        fisher[name] = fisher.get(name, 0.0) + param.grad.data ** 2
+                total_samples += 1
+            expert.eval()
+
+        if total_samples > 0:
+            for name in fisher:
+                fisher[name] /= total_samples
+
+        return fisher

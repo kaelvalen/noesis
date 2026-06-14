@@ -93,6 +93,15 @@ class NoesisMoE(nn.Module):
 
             out_flat[mask] += expert_weights.unsqueeze(-1) * expert_output
 
+        # Track how often each active expert is selected (for LRU eviction).
+        if not hasattr(self, "expert_usage"):
+            self.expert_usage = torch.zeros(
+                len(self.active_experts), device=self.device
+            )
+        for expert_slot in range(len(self.active_experts)):
+            mask = (indices_flat == expert_slot).any(dim=-1)
+            self.expert_usage[expert_slot] += mask.sum().float()
+
         return out_flat.view(B, S, self.vocab_size)
 
     def swap_expert(self, slot_idx, state_dict_path):
