@@ -12,23 +12,26 @@ import warnings
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class NoesisMoE(nn.Module):
-    def __init__(self, d_model=1024, num_experts=32, active=4, device="cuda"):
+    def __init__(self, d_model=1024, vocab_size=1024, num_experts=32, active=4, device="cuda"):
         super().__init__()
         self.d_model = d_model
+        self.vocab_size = vocab_size
         self.num_experts = num_experts
         self.active = active
         self.device = device
 
-        # Active experts in VRAM.
+        # Active experts in VRAM. Each expert is a small MLP that maps the
+        # adapted hidden state directly to vocabulary logits.
         self.active_experts = nn.ModuleList(
             [
                 nn.Sequential(
                     nn.Linear(d_model, 4 * d_model),
                     nn.GELU(),
-                    nn.Linear(4 * d_model, d_model),
+                    nn.Linear(4 * d_model, vocab_size),
                 ).to(device)
                 for _ in range(active)
             ]
@@ -43,7 +46,7 @@ class NoesisMoE(nn.Module):
                 dummy = nn.Sequential(
                     nn.Linear(d_model, 4 * d_model),
                     nn.GELU(),
-                    nn.Linear(4 * d_model, d_model),
+                    nn.Linear(4 * d_model, vocab_size),
                 )
                 torch.save(dummy.state_dict(), path)
 
@@ -51,25 +54,46 @@ class NoesisMoE(nn.Module):
         self.register_buffer("expert_mask", torch.ones(num_experts))
 
     def forward(self, x):
-        """x: (batch, seq, d_model). Returns output of same shape."""
+        """x: (batch, seq, d_model). Returns logits of shape (batch, seq, vocab_size).
+
+        Vectorized dispatch: tokens are flattened and routed to active experts
+        in a single pass, avoiding per-token Python loops.
+        """
         x = x.to(self.device)
+        B, S, D = x.shape
+
+        # Router: (B, S, num_experts)
         router_logits = self.router(x)
         masked = router_logits + (1 - self.expert_mask) * -1e9
-        weights, indices = torch.topk(torch.softmax(masked, dim=-1), self.active)
+        weights, indices = torch.topk(F.softmax(masked, dim=-1), self.active)
+        # weights: (B, S, active), indices: (B, S, active)
 
-        output = torch.zeros_like(x)
-        batch_size = x.size(0)
-        seq_len = x.size(1)
+        # Flatten for expert dispatch.
+        x_flat = x.view(-1, D)  # (B*S, D)
+        weights_flat = weights.view(-1, self.active)  # (B*S, active)
+        indices_flat = indices.view(-1, self.active)  # (B*S, active)
 
-        for i in range(self.active):
-            idx = indices[..., i]  # (batch, seq)
-            w = weights[..., i].unsqueeze(-1)  # (batch, seq, 1)
-            for b in range(batch_size):
-                for s in range(seq_len):
-                    expert_idx = idx[b, s].item()
-                    if expert_idx < len(self.active_experts) and self.expert_mask[expert_idx]:
-                        output[b, s] += w[b, s] * self.active_experts[expert_idx](x[b, s])
-        return output
+        out_flat = x_flat.new_zeros(B * S, self.vocab_size)  # (B*S, V)
+
+        # Dispatch each active expert over its assigned tokens.
+        for expert_slot in range(len(self.active_experts)):
+            # Tokens that routed to this expert slot in any of the top-k positions.
+            mask = (indices_flat == expert_slot).any(dim=-1)  # (B*S,)
+            if mask.sum() == 0:
+                continue
+
+            expert_input = x_flat[mask]  # (N, D)
+            expert_output = self.active_experts[expert_slot](expert_input)  # (N, V)
+
+            # Gather per-token weight for this expert slot.
+            # weights_flat shape: (B*S, active); find the column matching this slot.
+            matches = (indices_flat[mask] == expert_slot).float()  # (N, active)
+            # Sum over active dimension (only one non-zero per row typically).
+            expert_weights = (weights_flat[mask] * matches).sum(dim=-1)  # (N,)
+
+            out_flat[mask] += expert_weights.unsqueeze(-1) * expert_output
+
+        return out_flat.view(B, S, self.vocab_size)
 
     def swap_expert(self, slot_idx, state_dict_path):
         """Load an inactive expert state dict into an active slot."""

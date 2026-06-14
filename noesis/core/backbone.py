@@ -273,8 +273,9 @@ class NoesisBackbone(torch.nn.Module):
         with torch.no_grad():
             if self._backend_name == "mock":
                 logits, new_state, hidden = self.model.forward_with_hidden(tokens, state)
+            elif self._backend_name in ("rwkv", "mamba"):
+                logits, new_state, hidden = self._forward_with_hook(tokens, state)
             else:
-                # For RWKV/Mamba we approximate hidden states from logits.
                 logits, new_state = self.forward(tokens, state)
                 hidden = self._approximate_hidden_from_logits(logits)
         return logits, new_state, hidden
@@ -285,28 +286,106 @@ class NoesisBackbone(torch.nn.Module):
             if self._backend_name == "mock":
                 return self.model.get_hidden_states(tokens.to(self.device), state)
 
-            # Real RWKV exposes no public hidden-state API in all versions.
-            # Fallback: use the output logits and the inverse of the output
-            # embedding as an approximation (validated for mock; heuristic for
-            # real models). Production deployments should patch the model.
+            if self._backend_name in ("rwkv", "mamba"):
+                _, new_state, hidden = self._forward_with_hook(tokens, state)
+                return hidden
+
             logits, _ = self.forward(tokens, state)
             hidden = self._approximate_hidden_from_logits(logits)
         return hidden
 
+    def _find_head_module(self):
+        """Locate the final output projection module to hook for hidden states."""
+        for name, module in self.model.named_modules():
+            if name.split(".")[-1] in ("head", "lm_head", "output"):
+                return module
+        return None
+
+    def _forward_with_hook(self, tokens, state=None):
+        """Run a forward pass and capture the input to the output head.
+
+        For both RWKV and Mamba the pre-head hidden state is the input to the
+        final linear projection. A forward hook is the most backend-agnostic
+        way to retrieve it without forking model code.
+        """
+        head = self._find_head_module()
+        if head is None:
+            warnings.warn(
+                f"Could not locate output head module for backend '{self._backend_name}'; "
+                "falling back to logit-heuristic hidden approximation. "
+                "Production deployments should verify hidden-state extraction."
+            )
+            logits, new_state = self.forward(tokens, state)
+            return logits, new_state, self._approximate_hidden_from_logits(logits)
+
+        captured = {}
+
+        def _hook(module, inputs, output):
+            if isinstance(inputs, tuple) and inputs[0] is not None:
+                captured["hidden"] = inputs[0].detach().clone()
+
+        handle = head.register_forward_hook(_hook)
+        try:
+            if self._backend_name == "mamba":
+                out = self.model(tokens, inference_params=state)
+                logits = out.logits
+                new_state = out
+            else:  # rwkv
+                logits, new_state = self.model.forward(tokens, state)
+        finally:
+            handle.remove()
+
+        if "hidden" not in captured:
+            warnings.warn(
+                "Output-head hook did not capture a hidden state; "
+                "falling back to logit-heuristic hidden approximation."
+            )
+            return logits, new_state, self._approximate_hidden_from_logits(logits)
+
+        return logits, new_state, captured["hidden"]
+
     def _approximate_hidden_from_logits(self, logits):
-        """Approximate pre-output hidden states from logits (best-effort)."""
-        W = None
-        if hasattr(self.model, "get_header_weight"):
-            W = self.model.get_header_weight()
-        elif hasattr(self.model, "head") and hasattr(self.model.head, "weight"):
-            W = self.model.head.weight.data
+        """Approximate pre-output hidden states from logits (best-effort).
+
+        For a linear output head, logits = hidden @ W_out.T.  We estimate
+        hidden ≈ normalized_logits @ W_out, where normalized_logits are
+        logits with the per-token max subtracted for numerical stability.
+
+        This is a heuristic. Production RWKV deployments should patch the
+        backbone's forward() to return hidden states directly; see
+        patches/rwkv_hidden.patch.
+        """
+        W = self._output_weight()
         if W is None or W.shape[0] != logits.shape[-1] or W.shape[1] != self.d_model:
-            # Last-resort approximation: logits themselves as pseudo-hidden.
-            # This will only work if vocab_size == d_model.
+            # Last-resort: logits themselves as pseudo-hidden.
             return logits
-        probs = torch.softmax(logits, dim=-1)
-        hidden = torch.einsum("b s v, v d -> b s d", probs, W)
+
+        # Stable logits: subtract max per position.
+        norm_logits = logits - logits.amax(dim=-1, keepdim=True)
+        hidden = torch.einsum("b s v, v d -> b s d", norm_logits, W)
         return hidden
+
+    def _output_weight(self):
+        """Locate the output projection weight for hidden-state approximation."""
+        candidates = [
+            ("get_header_weight", lambda m: m.get_header_weight()),
+            ("head.weight", lambda m: getattr(m, "head", None).weight.data if hasattr(m, "head") else None),
+            ("lm_head.weight", lambda m: getattr(m, "lm_head", None).weight.data if hasattr(m, "lm_head") else None),
+        ]
+        # RWKV stores parameters in self.model.w as a dict.
+        if hasattr(self.model, "w") and isinstance(self.model.w, dict):
+            for key in ("head.weight", "output.weight", "lm_head.weight"):
+                if key in self.model.w:
+                    return self.model.w[key]
+
+        for name, getter in candidates:
+            try:
+                W = getter(self.model)
+                if W is not None:
+                    return W
+            except Exception:
+                continue
+        return None
 
     def backend_name(self) -> str:
         return self._backend_name

@@ -8,6 +8,10 @@ CRITICAL RULES:
 - Key and value are projections of the SAME hidden vector.
 - M and S are PERSISTENT across sessions.
 - Input must be DETACHED (gradient barrier from TTT).
+- W_key, W_val and the gating networks are FIXED random initializations.
+  Only M and S are updated online via the Titans rule. This removes the
+  ambiguity of "who updates what" and keeps the online learning signal
+  focused on the associative memory matrix.
 """
 
 import os
@@ -44,6 +48,16 @@ class NoesisTitansLMM:
         self.alpha_base = 0.05
         self.eta_base = 0.90
         self.theta_base = 0.001
+
+        # Freeze key/value projections and gating networks. They are treated as
+        # fixed random transforms; online learning happens only in M and S.
+        for p in self.W_key.parameters():
+            p.requires_grad = False
+        for p in self.W_val.parameters():
+            p.requires_grad = False
+        for gate in (self.gate_forget, self.gate_momentum, self.gate_lr):
+            for p in gate.parameters():
+                p.requires_grad = False
 
     def learn(self, hidden_states):
         """

@@ -44,6 +44,10 @@ noesis chat
 
 - `noesis init --model <path>` — initialize persistent state.
 - `noesis chat` — stateful chat that learns during conversation.
+  - `--max-tokens N`
+  - `--temperature T` (0.0 = greedy)
+  - `--top-k K`
+  - `--top-p P` (nucleus sampling)
 - `noesis learn-web <url> [<url> ...]` — ingest web pages into Vector DB.
 - `noesis learn-files <glob> [<glob> ...]` — ingest local files.
 - `noesis status` — show hardware placement, memory fill, and usage.

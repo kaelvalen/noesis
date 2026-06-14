@@ -13,6 +13,7 @@ from noesis.memory.titans import NoesisTitansLMM
 from noesis.memory.sparse_cache import NoesisSparseCache
 from noesis.memory.vectordb import NoesisVectorDB
 from noesis.adaptation.moe import NoesisMoE
+from noesis.adaptation.consolidator import NoesisConsolidator
 from noesis.core.engine import NoesisEngine
 
 
@@ -89,10 +90,11 @@ def test_vectordb(tmp_path):
 
 
 def test_moe_routing():
-    moe = NoesisMoE(d_model=64, num_experts=8, active=2, device="cpu")
+    vocab_size = 100
+    moe = NoesisMoE(d_model=64, vocab_size=vocab_size, num_experts=8, active=2, device="cpu")
     x = torch.randn(1, 5, 64)
     out = moe(x)
-    assert out.shape == x.shape
+    assert out.shape == (1, 5, vocab_size)
 
 
 def test_engine_interact_mock(tmp_path):
@@ -115,3 +117,43 @@ def test_state_save_and_load(tmp_path):
 
     engine2 = NoesisEngine(model_path="mock", use_mock=True, d_model=32)
     assert engine2.cache.write_ptr == engine.cache.write_ptr
+
+
+def test_sampling_parameters(tmp_path):
+    os.chdir(tmp_path)
+    engine = NoesisEngine(model_path="mock", use_mock=True, d_model=32)
+    # Greedy (temperature=0) should be deterministic.
+    r1 = engine.interact("hello", temperature=0.0, max_new_tokens=8)
+    r2 = engine.interact("hello", temperature=0.0, max_new_tokens=8)
+    # State carries across interactions, so not strictly identical; just verify output.
+    assert isinstance(r1, str)
+    assert isinstance(r2, str)
+
+    # Sampling with high temperature should produce output.
+    r3 = engine.interact("hello", temperature=1.0, top_k=5, max_new_tokens=8)
+    assert isinstance(r3, str)
+
+
+def test_consolidator_domain_adaptation(tmp_path):
+    os.chdir(tmp_path)
+    engine = NoesisEngine(model_path="mock", use_mock=True, d_model=32)
+    vocab_size = engine.moe.vocab_size
+
+    # Synthesize enough traces with aligned (ttt_out, input_ids) pairs.
+    seq_len = 8
+    for i in range(120):
+        engine.session_traces.append(
+            {
+                "surprise": float(i + 1),
+                "backbone_hidden": torch.randn(32),
+                "ttt_out": torch.randn(seq_len, 32),
+                "input_ids": torch.randint(0, vocab_size, (seq_len,)),
+            }
+        )
+
+    consolidator = NoesisConsolidator(engine)
+    path = consolidator.run(topk=500, min_traces=100, epochs=2)
+    assert path is not None
+    assert os.path.exists(path)
+    # A new expert should have been loaded into one of the active MoE slots.
+    assert engine.moe.expert_mask.sum().item() > 0

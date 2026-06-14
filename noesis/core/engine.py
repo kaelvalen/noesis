@@ -53,8 +53,14 @@ class NoesisEngine:
         # 5. Vector DB.
         self.vectordb = NoesisVectorDB(dim=d_model)
 
-        # 6. MoE.
-        self.moe = NoesisMoE(d_model=d_model, device=self.hw.resolve_device("moe"))
+        # 6. MoE (outputs logits directly).
+        vocab_size = getattr(
+            self.backbone.model, "vocab_size",
+            getattr(self.tokenizer, "vocab_size", 1024)
+        )
+        self.moe = NoesisMoE(
+            d_model=d_model, vocab_size=vocab_size, device=self.hw.resolve_device("moe")
+        )
 
         # Session state.
         self.backbone_state = self._load_backbone_state()
@@ -110,7 +116,14 @@ class NoesisEngine:
     # Main interaction loop
     # ------------------------------------------------------------------
 
-    def interact(self, user_input: str, max_new_tokens: int = 128):
+    def interact(
+        self,
+        user_input: str,
+        max_new_tokens: int = 128,
+        temperature: float = 0.8,
+        top_k: int = 50,
+        top_p: float = 0.9,
+    ):
         """Process a user turn, learn, and generate a response."""
         # 1. Tokenize.
         input_ids = self._encode(user_input)
@@ -148,7 +161,8 @@ class NoesisEngine:
         ttt_out, surprise = self.ttt(hidden, labels)
 
         # 6. Titans learn (CPU, persistent).
-        ttt_cpu = ttt_out[0].detach().cpu()  # (seq, dim) on CPU
+        # TTT output is already detached (gradient barrier); no extra detach needed.
+        ttt_cpu = ttt_out[0].cpu()  # (seq, dim) on CPU
         titans_loss = self.titans.learn(ttt_cpu)
 
         # 7. Sparse cache write (if surprising).
@@ -159,32 +173,29 @@ class NoesisEngine:
         # 8. MoE output (GPU/CPU per HAL).
         logits = self.moe(ttt_out)
 
-        # 9. Generate.
-        generated = []
-        for _ in range(max_new_tokens):
-            next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-            generated.append(next_token.item())
-            if next_token.item() == getattr(
-                self.tokenizer, "eos_token_id", 1
-            ):
-                break
-            # Re-run backbone for next token.
-            logits, self.backbone_state, hidden = self.backbone.forward_with_hidden(
-                next_token, self.backbone_state
-            )
-            ttt_out, _ = self.ttt(hidden, None)
-            logits = self.moe(ttt_out)
+        # 9. Generate with sampling.
+        generated = self._generate(
+            logits,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        )
 
         output_text = self._decode(generated)
 
         # 10. Trace and auto-save.
+        # Store post-TTT hidden states and the actual token ids so the
+        # consolidator can learn a real logit mapping instead of an identity.
         self.session_traces.append(
             {
                 "input": user_input,
                 "output": output_text,
                 "surprise": surprise,
                 "titans_loss": titans_loss,
-                "ttt_out": ttt_cpu.detach().clone(),
+                "backbone_hidden": hidden[0, -1].detach().cpu().clone(),
+                "ttt_out": ttt_cpu.clone(),
+                "input_ids": aug_ids[0].detach().cpu().clone(),
             }
         )
         self.interaction_count += 1
@@ -192,6 +203,71 @@ class NoesisEngine:
             self._autosave()
 
         return output_text
+
+    def _generate(
+        self,
+        logits,
+        max_new_tokens=512,
+        temperature=0.8,
+        top_k=50,
+        top_p=0.9,
+    ):
+        """Sample token ids from logits with temperature, top-k, and top-p."""
+        generated = []
+        eos_id = getattr(self.tokenizer, "eos_token_id", 1)
+
+        for _ in range(max_new_tokens):
+            next_logits = logits[:, -1, :]  # (batch, vocab)
+
+            if temperature > 0.0:
+                next_logits = next_logits / temperature
+
+                # Top-k filtering.
+                if top_k > 0:
+                    top_k = min(top_k, next_logits.size(-1))
+                    kth_vals = torch.topk(next_logits, top_k)[0][..., -1, None]
+                    indices_to_remove = next_logits < kth_vals
+                    next_logits = next_logits.masked_fill(
+                        indices_to_remove, -float("inf")
+                    )
+
+                # Top-p (nucleus) filtering.
+                if 0.0 < top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(
+                        next_logits, descending=True
+                    )
+                    cumulative_probs = torch.cumsum(
+                        F.softmax(sorted_logits, dim=-1), dim=-1
+                    )
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+                        ..., :-1
+                    ].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    indices_to_remove = sorted_indices_to_remove.scatter(
+                        -1, sorted_indices, sorted_indices_to_remove
+                    )
+                    next_logits = next_logits.masked_fill(
+                        indices_to_remove, -float("inf")
+                    )
+
+                probs = F.softmax(next_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
+
+            generated.append(next_token.item())
+            if next_token.item() == eos_id:
+                break
+
+            # Re-run backbone for next token.
+            logits, self.backbone_state, hidden = self.backbone.forward_with_hidden(
+                next_token, self.backbone_state
+            )
+            ttt_out, _ = self.ttt(hidden, None)
+            logits = self.moe(ttt_out)
+
+        return generated
 
     # ------------------------------------------------------------------
     # Ingestion
