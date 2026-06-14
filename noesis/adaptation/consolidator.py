@@ -33,7 +33,7 @@ class NoesisConsolidator:
         min_traces=100,
         epochs=5,
         val_split=0.1,
-        use_ewc=True,
+        use_ewc=False,
         ewc_lambda=100.0,
         fisher_samples=200,
     ):
@@ -103,17 +103,22 @@ class NoesisConsolidator:
         )
         opt = torch.optim.Adam(adapter.parameters(), lr=1e-4)
 
-        # EWC setup: remember old parameters and Fisher diagonal of active experts.
+        # EWC setup: remember the adapter's initial weights and estimate a
+        # Fisher diagonal on the new domain data. The penalty then discourages
+        # the new adapter from deviating too far from its own initialization
+        # on parameters that are important for the new traces. This is the
+        # correct local semantics when the original experts' training data is
+        # no longer available.
         fisher_reg = {}
         old_params = {}
         if use_ewc:
-            fisher_reg = self._compute_fisher(
-                self.engine.moe, X_train, Y_train, n_samples=fisher_samples
-            )
             old_params = {
                 name: param.clone().detach()
                 for name, param in adapter.named_parameters()
             }
+            fisher_reg = self._compute_fisher(
+                adapter, X_train, Y_train, n_samples=fisher_samples
+            )
 
         best_val_loss = float("inf")
         for epoch in range(epochs):
@@ -175,21 +180,16 @@ class NoesisConsolidator:
         return path
 
     def _find_least_used_slot(self, moe):
-        """Return the active expert slot with the lowest usage count.
+        """Return the active expert slot with the lowest usage count."""
+        active_usage = moe.expert_usage[: moe.active]
+        return torch.argmin(active_usage).item()
 
-        Falls back to slot 0 if no usage statistics have been collected yet.
-        """
-        if not hasattr(moe, "expert_usage"):
-            return 0
-        return torch.argmin(moe.expert_usage).item()
+    def _compute_fisher(self, model, X, Y, n_samples=200):
+        """Estimate the diagonal Fisher information of a model on (X, Y).
 
-    def _compute_fisher(self, moe, X, Y, n_samples=200):
-        """Estimate the diagonal Fisher information of the active experts.
-
-        The Fisher values are averaged across all active experts and normalized
-        by the number of samples used. The resulting keys match the parameter
-        names of a standard MoE expert / consolidation adapter, so they can be
-        used directly for EWC regularization.
+        The Fisher diagonal tells us which parameters are most important for
+        the given data distribution. In EWC it is paired with the model's
+        initial weights to penalize large changes on important parameters.
         """
         fisher = {}
         n = min(n_samples, len(X))
@@ -197,22 +197,24 @@ class NoesisConsolidator:
             return fisher
         idx = torch.randperm(len(X))[:n]
 
+        was_training = model.training
+        model.train()
         total_samples = 0
-        for expert in moe.active_experts:
-            expert.train()
-            for i in idx:
-                expert.zero_grad()
-                out = expert(X[i].unsqueeze(0))
-                loss = F.cross_entropy(out, Y[i].unsqueeze(0))
-                loss.backward()
-                for name, param in expert.named_parameters():
-                    if param.grad is not None:
-                        fisher[name] = fisher.get(name, 0.0) + param.grad.data ** 2
-                total_samples += 1
-            expert.eval()
+        for i in idx:
+            model.zero_grad()
+            out = model(X[i].unsqueeze(0))
+            loss = F.cross_entropy(out, Y[i].unsqueeze(0))
+            loss.backward()
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    fisher[name] = fisher.get(name, 0.0) + param.grad.data ** 2
+            total_samples += 1
 
         if total_samples > 0:
             for name in fisher:
                 fisher[name] /= total_samples
+
+        if not was_training:
+            model.eval()
 
         return fisher

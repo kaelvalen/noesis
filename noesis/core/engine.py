@@ -151,6 +151,9 @@ class NoesisEngine:
 
         aug_ids = self._encode(augmented_input)
 
+        # Reset sequence-local TTT fast weights at the start of each interaction.
+        self.ttt.reset()
+
         # 4. Backbone forward (stateful, frozen) — return logits + hidden states.
         logits, self.backbone_state, hidden = self.backbone.forward_with_hidden(
             aug_ids, self.backbone_state
@@ -264,7 +267,8 @@ class NoesisEngine:
             logits, self.backbone_state, hidden = self.backbone.forward_with_hidden(
                 next_token, self.backbone_state
             )
-            ttt_out, _ = self.ttt(hidden, None)
+            # Use frozen TTT during generation: do not mutate sequence-local W_fast.
+            ttt_out = self.ttt.forward_eval(hidden)
             logits = self.moe(ttt_out)
 
         return generated

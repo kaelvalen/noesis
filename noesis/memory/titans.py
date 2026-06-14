@@ -71,16 +71,16 @@ class NoesisTitansLMM:
         key/value projections and gating networks. Gates are trained by a
         surrogate loss that measures whether the M update improved retrieval
         quality for the current token.
-        Returns final reconstruction loss scalar.
+        Returns the average reconstruction loss over the sequence.
         """
         if hidden_states.dim() == 3:
             hidden_states = hidden_states.squeeze(0)
         hidden_states = hidden_states.to(self.device)
 
         gate_period = 16
-        accumulated_loss = 0.0
+        accumulated_loss = torch.tensor(0.0, device=self.device)
         accumulated_steps = 0
-        final_loss = 0.0
+        total_recon_loss = 0.0
         gate_loss_weight = 1.0
 
         for t in range(len(hidden_states)):
@@ -92,9 +92,9 @@ class NoesisTitansLMM:
 
             # Self-supervised reconstruction loss.
             loss_t = F.mse_loss(v_pred_old, v_t)
-            accumulated_loss += loss_t
+            accumulated_loss = accumulated_loss + loss_t
             accumulated_steps += 1
-            final_loss = loss_t.item()
+            total_recon_loss += loss_t.item()
 
             # Manual gradient of loss w.r.t. M.
             grad_M = torch.outer(v_pred_old - v_t, k_t)
@@ -143,14 +143,14 @@ class NoesisTitansLMM:
                 + F.binary_cross_entropy(eta_tensor, target)
                 + F.binary_cross_entropy(theta_tensor, target)
             )
-            accumulated_loss += gate_loss_weight * gate_loss_t
+            accumulated_loss = accumulated_loss + gate_loss_weight * gate_loss_t
 
             # Periodic end-to-end update of W_key/W_val and gating networks.
             if accumulated_steps % gate_period == 0:
                 self.gate_optimizer.zero_grad()
                 accumulated_loss.backward()
                 self.gate_optimizer.step()
-                accumulated_loss = 0.0
+                accumulated_loss = torch.tensor(0.0, device=self.device)
 
         # Leftover tokens that did not fill a full gate_period window.
         if accumulated_steps % gate_period != 0:
@@ -163,7 +163,8 @@ class NoesisTitansLMM:
         if self._learn_count % 1000 < len(hidden_states):
             self.compress_memory()
 
-        return final_loss
+        # Return average reconstruction loss over the sequence.
+        return total_recon_loss / len(hidden_states)
 
     def retrieve(self, query_hidden):
         """

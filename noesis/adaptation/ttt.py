@@ -88,3 +88,21 @@ class NoesisTTT(nn.Module):
 
         # GRADIENT BARRIER: detach before Titans.
         return adapted.detach(), surprise
+
+    def forward_eval(self, hidden_states):
+        """Inference-time TTT: apply current W_fast without updating it.
+
+        Use this during autoregressive generation so that the sequence-local
+        fast weights are not further mutated by generated tokens.
+        """
+        hidden_states = hidden_states.to(self.device)
+        if (
+            self.W_fast is None
+            or self.W_fast.size(0) != hidden_states.size(0)
+            or self.W_fast.dtype != hidden_states.dtype
+        ):
+            self.init_sequence(hidden_states.size(0), dtype=hidden_states.dtype)
+
+        # Apply adapted fast weights without inner-loop updates.
+        adapted = torch.bmm(hidden_states, self.W_fast)
+        return adapted.detach()

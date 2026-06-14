@@ -52,6 +52,9 @@ class NoesisMoE(nn.Module):
 
         self.router = nn.Linear(d_model, num_experts).to(device)
         self.register_buffer("expert_mask", torch.ones(num_experts))
+        # Usage counter for LRU eviction. Persisted as a buffer so it survives
+        # save()/load() and sessions.
+        self.register_buffer("expert_usage", torch.zeros(num_experts))
 
     def forward(self, x):
         """x: (batch, seq, d_model). Returns logits of shape (batch, seq, vocab_size).
@@ -94,10 +97,6 @@ class NoesisMoE(nn.Module):
             out_flat[mask] += expert_weights.unsqueeze(-1) * expert_output
 
         # Track how often each active expert is selected (for LRU eviction).
-        if not hasattr(self, "expert_usage"):
-            self.expert_usage = torch.zeros(
-                len(self.active_experts), device=self.device
-            )
         for expert_slot in range(len(self.active_experts)):
             mask = (indices_flat == expert_slot).any(dim=-1)
             self.expert_usage[expert_slot] += mask.sum().float()
